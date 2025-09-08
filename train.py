@@ -16,7 +16,7 @@ from video import VideoRecorder
 from logger import Logger
 from replay_buffer import ReplayBuffer
 import utils
-
+import json
 import dmc2gym
 
 
@@ -222,6 +222,8 @@ def main():
     now = datetime.now()
     output_dir = f"./exp/{now.strftime('%Y.%m.%d')}/{now.strftime('%H%M')}_sac_{args.experiment}"
     os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, 'args.json'), 'w') as f:
+        json.dump(vars(args), f, sort_keys=True, indent=4)
     os.chdir(output_dir)
 
     workspace = Workspace(args)
