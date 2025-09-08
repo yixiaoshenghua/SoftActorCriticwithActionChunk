@@ -51,3 +51,17 @@ class ReplayBuffer(object):
                                            device=self.device)
 
         return obses, actions, rewards, next_obses, not_dones, not_dones_no_max
+
+    def sample_chunk(self, batch_size, chunk_size):
+        """Sample continuous chunk of h transitions."""
+        max_start = (self.capacity if self.full else self.idx) - chunk_size
+        start_idxs = np.random.randint(0, max_start, size=batch_size)
+
+        states = torch.as_tensor(self.obses[start_idxs], device=self.device).float()
+        action_chunks = torch.as_tensor(np.concatenate([self.actions[start_idxs + i] for i in range(chunk_size)], axis=1), device=self.device)
+        reward_chunks = torch.as_tensor(np.concatenate([self.rewards[start_idxs + i] for i in range(chunk_size)], axis=1), device=self.device)
+        next_states = torch.as_tensor(self.next_obses[start_idxs + chunk_size - 1], device=self.device).float()  # st+h
+        not_dones = torch.as_tensor(self.not_dones[start_idxs + chunk_size - 1], device=self.device)
+        not_dones_no_max = torch.as_tensor(self.not_dones_no_max[start_idxs + chunk_size - 1], device=self.device)
+
+        return states, action_chunks, reward_chunks, next_states, not_dones, not_dones_no_max

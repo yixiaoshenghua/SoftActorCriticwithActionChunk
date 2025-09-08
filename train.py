@@ -66,10 +66,10 @@ class Workspace(object):
         # Manually instantiate actor, critic, and agent (replacing hydra.utils.instantiate)
         from agent.actor import DiagGaussianActor
         actor_log_std_bounds = [int(x) for x in cfg.actor_log_std_bounds.split(',')]
-        actor = DiagGaussianActor(obs_dim, action_dim, cfg.actor_hidden_dim, cfg.actor_hidden_depth, actor_log_std_bounds)
+        actor = DiagGaussianActor(obs_dim, action_dim, cfg.actor_hidden_dim, cfg.actor_hidden_depth, actor_log_std_bounds, chunk_size=cfg.chunk_size)
 
         from agent.critic import DoubleQCritic
-        critic = DoubleQCritic(obs_dim, action_dim, cfg.critic_hidden_dim, cfg.critic_hidden_depth)
+        critic = DoubleQCritic(obs_dim, action_dim, cfg.critic_hidden_dim, cfg.critic_hidden_depth, chunk_size=cfg.chunk_size)
 
         from agent.sac import SACAgent
         self.agent = SACAgent(obs_dim, action_dim, action_range, self.device, critic, actor,
@@ -85,7 +85,8 @@ class Workspace(object):
                               critic_tau=cfg.critic_tau,
                               critic_target_update_frequency=cfg.critic_target_update_frequency,
                               batch_size=cfg.batch_size,
-                              learnable_temperature=cfg.learnable_temperature)
+                              learnable_temperature=cfg.learnable_temperature,
+                              chunk_size=cfg.chunk_size)
 
         self.replay_buffer = ReplayBuffer(self.env.observation_space.shape,
                                           self.env.action_space.shape,
@@ -95,6 +96,7 @@ class Workspace(object):
         self.video_recorder = VideoRecorder(
             self.work_dir if cfg.save_video else None)
         self.step = 0
+        self.chunk_step = 0  # Track steps within chunk
 
     def evaluate(self):
         average_episode_reward = 0
@@ -104,12 +106,16 @@ class Workspace(object):
             self.video_recorder.init(enabled=(episode == 0))
             done = False
             episode_reward = 0
+            self.chunk_step = 0
             while not done:
-                with utils.eval_mode(self.agent):
-                    action = self.agent.act(obs, sample=False)
+                if self.chunk_step == 0:
+                    with utils.eval_mode(self.agent):
+                        action_chunk = self.agent.act(obs, sample=False)
+                action = action_chunk[self.chunk_step]
                 obs, reward, done, _ = self.env.step(action)
                 self.video_recorder.record(self.env)
                 episode_reward += reward
+                self.chunk_step = (self.chunk_step + 1) % self.cfg.chunk_size
 
             average_episode_reward += episode_reward
             self.video_recorder.save(f'{self.step}.mp4')
@@ -121,6 +127,7 @@ class Workspace(object):
     def run(self):
         episode, episode_reward, done = 0, 0, True
         start_time = time.time()
+        current_chunk = None
         while self.step < self.cfg.num_train_steps:
             if done:
                 if self.step > 0:
@@ -144,15 +151,21 @@ class Workspace(object):
                 episode_reward = 0
                 episode_step = 0
                 episode += 1
+                self.chunk_step = 0
+                current_chunk = None
 
                 self.logger.log('train/episode', episode, self.step)
 
             # sample action for data collection
-            if self.step < self.cfg.num_seed_steps:
-                action = self.env.action_space.sample()
-            else:
-                with utils.eval_mode(self.agent):
-                    action = self.agent.act(obs, sample=True)
+            if self.chunk_step == 0:  # Predict new chunk every h steps
+                if self.step < self.cfg.num_seed_steps:
+                    current_chunk = np.array([self.env.action_space.sample() for _ in range(self.cfg.chunk_size)])
+                else:
+                    with utils.eval_mode(self.agent):
+                        current_chunk = self.agent.act(obs, sample=True)
+                current_chunk = np.clip(current_chunk, self.env.action_space.low, self.env.action_space.high)
+
+            action = current_chunk[self.chunk_step]  # Execute one action from chunk
 
             # run training update
             if self.step >= self.cfg.num_seed_steps:
@@ -171,6 +184,7 @@ class Workspace(object):
             obs = next_obs
             episode_step += 1
             self.step += 1
+            self.chunk_step = (self.chunk_step + 1) % self.cfg.chunk_size
 
 
 def main():
@@ -211,6 +225,9 @@ def main():
     parser.add_argument('--actor_log_std_bounds', type=str, default='-5,2', help='Actor log std bounds (comma-separated)')
     parser.add_argument('--critic_hidden_dim', type=int, default=1024, help='Critic hidden dimension')
     parser.add_argument('--critic_hidden_depth', type=int, default=2, help='Critic hidden depth')
+
+    # New parameter for chunking
+    parser.add_argument('--chunk_size', type=int, default=5, help='Action chunk size (h) for temporally extended action space')
 
     args = parser.parse_args()
 
