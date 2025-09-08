@@ -1,0 +1,1007 @@
+README.md
+# Soft Actor-Critic (SAC) implementation in PyTorch
+
+This is PyTorch implementation of Soft Actor-Critic (SAC) [[ArXiv]](https://arxiv.org/abs/1812.05905).
+
+If you use this code in your research project please cite us as:
+```
+@misc{pytorch_sac,
+  author = {Yarats, Denis and Kostrikov, Ilya},
+  title = {Soft Actor-Critic (SAC) implementation in PyTorch},
+  year = {2020},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/denisyarats/pytorch_sac}},
+}
+```
+
+## Requirements
+We assume you have access to a gpu that can run CUDA 9.2. Then, the simplest way to install all required dependencies is to create an anaconda environment and activate it:
+```
+conda env create -f conda_env.yml
+source activate pytorch_sac
+```
+
+## Instructions
+To train an SAC agent on the `cheetah run` task run:
+```
+python train.py env=cheetah_run
+```
+This will produce `exp` folder, where all the outputs are going to be stored including train/eval logs, tensorboard blobs, and evaluation episode videos. One can attacha tensorboard to monitor training by running:
+```
+tensorboard --logdir exp
+```
+
+## Results
+An extensive benchmarking of SAC on the DM Control Suite against D4PG. We plot an average performance of SAC over 3 seeds together with p95 confidence intervals. Importantly, we keep the hyperparameters fixed across all the tasks. Note that results for D4PG are reported after 10^8 steps and taken from the original paper.
+![Results](figures/dm_control.png)
+
+replay_buffer.py
+import numpy as np
+import torch
+
+
+class ReplayBuffer(object):
+    """Buffer to store environment transitions."""
+    def __init__(self, obs_shape, action_shape, capacity, device):
+        self.capacity = capacity
+        self.device = device
+
+        # the proprioceptive obs is stored as float32, pixels obs as uint8
+        obs_dtype = np.float32 if len(obs_shape) == 1 else np.uint8
+
+        self.obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
+        self.next_obses = np.empty((capacity, *obs_shape), dtype=obs_dtype)
+        self.actions = np.empty((capacity, *action_shape), dtype=np.float32)
+        self.rewards = np.empty((capacity, 1), dtype=np.float32)
+        self.not_dones = np.empty((capacity, 1), dtype=np.float32)
+        self.not_dones_no_max = np.empty((capacity, 1), dtype=np.float32)
+
+        self.idx = 0
+        self.last_save = 0
+        self.full = False
+
+    def __len__(self):
+        return self.capacity if self.full else self.idx
+
+    def add(self, obs, action, reward, next_obs, done, done_no_max):
+        np.copyto(self.obses[self.idx], obs)
+        np.copyto(self.actions[self.idx], action)
+        np.copyto(self.rewards[self.idx], reward)
+        np.copyto(self.next_obses[self.idx], next_obs)
+        np.copyto(self.not_dones[self.idx], not done)
+        np.copyto(self.not_dones_no_max[self.idx], not done_no_max)
+
+        self.idx = (self.idx + 1) % self.capacity
+        self.full = self.full or self.idx == 0
+
+    def sample(self, batch_size):
+        idxs = np.random.randint(0,
+                                 self.capacity if self.full else self.idx,
+                                 size=batch_size)
+
+        obses = torch.as_tensor(self.obses[idxs], device=self.device).float()
+        actions = torch.as_tensor(self.actions[idxs], device=self.device)
+        rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
+        next_obses = torch.as_tensor(self.next_obses[idxs],
+                                     device=self.device).float()
+        not_dones = torch.as_tensor(self.not_dones[idxs], device=self.device)
+        not_dones_no_max = torch.as_tensor(self.not_dones_no_max[idxs],
+                                           device=self.device)
+
+        return obses, actions, rewards, next_obses, not_dones, not_dones_no_max
+utils.py
+import numpy as np
+import torch
+from torch import nn
+from torch import distributions as pyd
+import torch.nn.functional as F
+import gym
+import os
+from collections import deque
+import random
+import math
+
+import dmc2gym
+
+
+def make_env(cfg):
+    """Helper function to create dm_control environment"""
+    if cfg.env == 'ball_in_cup_catch':
+        domain_name = 'ball_in_cup'
+        task_name = 'catch'
+    else:
+        domain_name = cfg.env.split('_')[0]
+        task_name = '_'.join(cfg.env.split('_')[1:])
+
+    env = dmc2gym.make(domain_name=domain_name,
+                       task_name=task_name,
+                       seed=cfg.seed,
+                       visualize_reward=True)
+    env.seed(cfg.seed)
+    assert env.action_space.low.min() >= -1
+    assert env.action_space.high.max() <= 1
+
+    return env
+
+
+class eval_mode(object):
+    def __init__(self, *models):
+        self.models = models
+
+    def __enter__(self):
+        self.prev_states = []
+        for model in self.models:
+            self.prev_states.append(model.training)
+            model.train(False)
+
+    def __exit__(self, *args):
+        for model, state in zip(self.models, self.prev_states):
+            model.train(state)
+        return False
+
+
+class train_mode(object):
+    def __init__(self, *models):
+        self.models = models
+
+    def __enter__(self):
+        self.prev_states = []
+        for model in self.models:
+            self.prev_states.append(model.training)
+            model.train(True)
+
+    def __exit__(self, *args):
+        for model, state in zip(self.models, self.prev_states):
+            model.train(state)
+        return False
+
+
+def soft_update_params(net, target_net, tau):
+    for param, target_param in zip(net.parameters(), target_net.parameters()):
+        target_param.data.copy_(tau * param.data +
+                                (1 - tau) * target_param.data)
+
+def set_seed_everywhere(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def make_dir(*path_parts):
+    dir_path = os.path.join(*path_parts)
+    try:
+        os.mkdir(dir_path)
+    except OSError:
+        pass
+    return dir_path
+
+def weight_init(m):
+    """Custom weight init for Conv2D and Linear layers."""
+    if isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight.data)
+        if hasattr(m.bias, 'data'):
+            m.bias.data.fill_(0.0)
+
+
+class MLP(nn.Module):
+    def __init__(self,
+                 input_dim,
+                 hidden_dim,
+                 output_dim,
+                 hidden_depth,
+                 output_mod=None):
+        super().__init__()
+        self.trunk = mlp(input_dim, hidden_dim, output_dim, hidden_depth,
+                         output_mod)
+        self.apply(weight_init)
+
+    def forward(self, x):
+        return self.trunk(x)
+
+
+def mlp(input_dim, hidden_dim, output_dim, hidden_depth, output_mod=None):
+    if hidden_depth == 0:
+        mods = [nn.Linear(input_dim, output_dim)]
+    else:
+        mods = [nn.Linear(input_dim, hidden_dim), nn.ReLU(inplace=True)]
+        for i in range(hidden_depth - 1):
+            mods += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True)]
+        mods.append(nn.Linear(hidden_dim, output_dim))
+    if output_mod is not None:
+        mods.append(output_mod)
+    trunk = nn.Sequential(*mods)
+    return trunk
+
+def to_np(t):
+    if t is None:
+        return None
+    elif t.nelement() == 0:
+        return np.array([])
+    else:
+        return t.cpu().detach().numpy()
+
+logger.py
+from torch.utils.tensorboard import SummaryWriter
+from collections import defaultdict
+import json
+import os
+import csv
+import shutil
+import torch
+import numpy as np
+from termcolor import colored
+
+COMMON_TRAIN_FORMAT = [
+    ('episode', 'E', 'int'),
+    ('step', 'S', 'int'),
+    ('episode_reward', 'R', 'float'),
+    ('duration', 'D', 'time') 
+]
+
+COMMON_EVAL_FORMAT = [
+    ('episode', 'E', 'int'),
+    ('step', 'S', 'int'),
+    ('episode_reward', 'R', 'float') 
+]
+
+
+AGENT_TRAIN_FORMAT = {
+    'sac': [
+        ('batch_reward', 'BR', 'float'),
+        ('actor_loss', 'ALOSS', 'float'),
+        ('critic_loss', 'CLOSS', 'float'),
+        ('alpha_loss', 'TLOSS', 'float'),
+        ('alpha_value', 'TVAL', 'float'),
+        ('actor_entropy', 'AENT', 'float')
+    ]
+}
+
+
+class AverageMeter(object):
+    def __init__(self):
+        self._sum = 0
+        self._count = 0
+
+    def update(self, value, n=1):
+        self._sum += value
+        self._count += n
+
+    def value(self):
+        return self._sum / max(1, self._count)
+
+
+class MetersGroup(object):
+    def __init__(self, file_name, formating):
+        self._csv_file_name = self._prepare_file(file_name, 'csv')
+        self._formating = formating
+        self._meters = defaultdict(AverageMeter)
+        self._csv_file = open(self._csv_file_name, 'w')
+        self._csv_writer = None
+
+    def _prepare_file(self, prefix, suffix):
+        file_name = f'{prefix}.{suffix}'
+        if os.path.exists(file_name):
+            os.remove(file_name)
+        return file_name
+
+    def log(self, key, value, n=1):
+        self._meters[key].update(value, n)
+
+    def _prime_meters(self):
+        data = dict()
+        for key, meter in self._meters.items():
+            if key.startswith('train'):
+                key = key[len('train') + 1:]
+            else:
+                key = key[len('eval') + 1:]
+            key = key.replace('/', '_')
+            data[key] = meter.value()
+        return data
+
+    def _dump_to_csv(self, data):
+        if self._csv_writer is None:
+            self._csv_writer = csv.DictWriter(self._csv_file,
+                                              fieldnames=sorted(data.keys()),
+                                              restval=0.0)
+            self._csv_writer.writeheader()
+        self._csv_writer.writerow(data)
+        self._csv_file.flush()
+
+    def _format(self, key, value, ty):
+        if ty == 'int':
+            value = int(value)
+            return f'{key}: {value}'
+        elif ty == 'float':
+            return f'{key}: {value:.04f}'
+        elif ty == 'time':
+            return f'{key}: {value:04.1f} s'
+        else:
+            raise f'invalid format type: {ty}'
+
+    def _dump_to_console(self, data, prefix):
+        prefix = colored(prefix, 'yellow' if prefix == 'train' else 'green')
+        pieces = [f'| {prefix: <14}']
+        for key, disp_key, ty in self._formating:
+            value = data.get(key, 0)
+            pieces.append(self._format(disp_key, value, ty))
+        print(' | '.join(pieces))
+
+    def dump(self, step, prefix, save=True):
+        if len(self._meters) == 0:
+            return
+        if save:
+            data = self._prime_meters()
+            data['step'] = step
+            self._dump_to_csv(data)
+            self._dump_to_console(data, prefix)
+        self._meters.clear()
+
+
+class Logger(object):
+    def __init__(self,
+                 log_dir,
+                 save_tb=False,
+                 log_frequency=10000,
+                 agent='sac'):
+        self._log_dir = log_dir
+        self._log_frequency = log_frequency
+        if save_tb:
+            tb_dir = os.path.join(log_dir, 'tb')
+            if os.path.exists(tb_dir):
+                try:
+                    shutil.rmtree(tb_dir)
+                except:
+                    print("logger.py warning: Unable to remove tb directory")
+                    pass
+            self._sw = SummaryWriter(tb_dir)
+        else:
+            self._sw = None
+        # each agent has specific output format for training
+        assert agent in AGENT_TRAIN_FORMAT
+        train_format = COMMON_TRAIN_FORMAT + AGENT_TRAIN_FORMAT[agent]
+        self._train_mg = MetersGroup(os.path.join(log_dir, 'train'),
+                                     formating=train_format)
+        self._eval_mg = MetersGroup(os.path.join(log_dir, 'eval'),
+                                    formating=COMMON_EVAL_FORMAT)
+
+    def _should_log(self, step, log_frequency):
+        log_frequency = log_frequency or self._log_frequency
+        return step % log_frequency == 0
+
+    def _try_sw_log(self, key, value, step):
+        if self._sw is not None:
+            self._sw.add_scalar(key, value, step)
+
+    def _try_sw_log_video(self, key, frames, step):
+        if self._sw is not None:
+            frames = torch.from_numpy(np.array(frames))
+            frames = frames.unsqueeze(0)
+            self._sw.add_video(key, frames, step, fps=30)
+
+    def _try_sw_log_histogram(self, key, histogram, step):
+        if self._sw is not None:
+            self._sw.add_histogram(key, histogram, step)
+
+    def log(self, key, value, step, n=1, log_frequency=1):
+        if not self._should_log(step, log_frequency):
+            return
+        assert key.startswith('train') or key.startswith('eval')
+        if type(value) == torch.Tensor:
+            value = value.item()
+        self._try_sw_log(key, value / n, step)
+        mg = self._train_mg if key.startswith('train') else self._eval_mg
+        mg.log(key, value, n)
+
+    def log_param(self, key, param, step, log_frequency=None):
+        if not self._should_log(step, log_frequency):
+            return
+        self.log_histogram(key + '_w', param.weight.data, step)
+        if hasattr(param.weight, 'grad') and param.weight.grad is not None:
+            self.log_histogram(key + '_w_g', param.weight.grad.data, step)
+        if hasattr(param, 'bias') and hasattr(param.bias, 'data'):
+            self.log_histogram(key + '_b', param.bias.data, step)
+            if hasattr(param.bias, 'grad') and param.bias.grad is not None:
+                self.log_histogram(key + '_b_g', param.bias.grad.data, step)
+
+    def log_video(self, key, frames, step, log_frequency=None):
+        if not self._should_log(step, log_frequency):
+            return
+        assert key.startswith('train') or key.startswith('eval')
+        self._try_sw_log_video(key, frames, step)
+
+    def log_histogram(self, key, histogram, step, log_frequency=None):
+        if not self._should_log(step, log_frequency):
+            return
+        assert key.startswith('train') or key.startswith('eval')
+        self._try_sw_log_histogram(key, histogram, step)
+
+    def dump(self, step, save=True, ty=None):
+        if ty is None:
+            self._train_mg.dump(step, 'train', save)
+            self._eval_mg.dump(step, 'eval', save)
+        elif ty == 'eval':
+            self._eval_mg.dump(step, 'eval', save)
+        elif ty == 'train':
+            self._train_mg.dump(step, 'train', save)
+        else:
+            raise f'invalid log type: {ty}'
+
+train.py
+#!/usr/bin/env python3
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import copy
+import math
+import os
+import sys
+import time
+import pickle as pkl
+
+from video import VideoRecorder
+from logger import Logger
+from replay_buffer import ReplayBuffer
+import utils
+
+import dmc2gym
+import hydra
+
+
+def make_env(cfg):
+    """Helper function to create dm_control environment"""
+    if cfg.env == 'ball_in_cup_catch':
+        domain_name = 'ball_in_cup'
+        task_name = 'catch'
+    else:
+        domain_name = cfg.env.split('_')[0]
+        task_name = '_'.join(cfg.env.split('_')[1:])
+
+    env = dmc2gym.make(domain_name=domain_name,
+                       task_name=task_name,
+                       seed=cfg.seed,
+                       visualize_reward=True)
+    env.seed(cfg.seed)
+    assert env.action_space.low.min() >= -1
+    assert env.action_space.high.max() <= 1
+
+    return env
+
+
+class Workspace(object):
+    def __init__(self, cfg):
+        self.work_dir = os.getcwd()
+        print(f'workspace: {self.work_dir}')
+
+        self.cfg = cfg
+
+        self.logger = Logger(self.work_dir,
+                             save_tb=cfg.log_save_tb,
+                             log_frequency=cfg.log_frequency,
+                             agent=cfg.agent.name)
+
+        utils.set_seed_everywhere(cfg.seed)
+        self.device = torch.device(cfg.device)
+        self.env = utils.make_env(cfg)
+
+        cfg.agent.params.obs_dim = self.env.observation_space.shape[0]
+        cfg.agent.params.action_dim = self.env.action_space.shape[0]
+        cfg.agent.params.action_range = [
+            float(self.env.action_space.low.min()),
+            float(self.env.action_space.high.max())
+        ]
+        self.agent = hydra.utils.instantiate(cfg.agent)
+
+        self.replay_buffer = ReplayBuffer(self.env.observation_space.shape,
+                                          self.env.action_space.shape,
+                                          int(cfg.replay_buffer_capacity),
+                                          self.device)
+
+        self.video_recorder = VideoRecorder(
+            self.work_dir if cfg.save_video else None)
+        self.step = 0
+
+    def evaluate(self):
+        average_episode_reward = 0
+        for episode in range(self.cfg.num_eval_episodes):
+            obs = self.env.reset()
+            self.agent.reset()
+            self.video_recorder.init(enabled=(episode == 0))
+            done = False
+            episode_reward = 0
+            while not done:
+                with utils.eval_mode(self.agent):
+                    action = self.agent.act(obs, sample=False)
+                obs, reward, done, _ = self.env.step(action)
+                self.video_recorder.record(self.env)
+                episode_reward += reward
+
+            average_episode_reward += episode_reward
+            self.video_recorder.save(f'{self.step}.mp4')
+        average_episode_reward /= self.cfg.num_eval_episodes
+        self.logger.log('eval/episode_reward', average_episode_reward,
+                        self.step)
+        self.logger.dump(self.step)
+
+    def run(self):
+        episode, episode_reward, done = 0, 0, True
+        start_time = time.time()
+        while self.step < self.cfg.num_train_steps:
+            if done:
+                if self.step > 0:
+                    self.logger.log('train/duration',
+                                    time.time() - start_time, self.step)
+                    start_time = time.time()
+                    self.logger.dump(
+                        self.step, save=(self.step > self.cfg.num_seed_steps))
+
+                # evaluate agent periodically
+                if self.step > 0 and self.step % self.cfg.eval_frequency == 0:
+                    self.logger.log('eval/episode', episode, self.step)
+                    self.evaluate()
+
+                self.logger.log('train/episode_reward', episode_reward,
+                                self.step)
+
+                obs = self.env.reset()
+                self.agent.reset()
+                done = False
+                episode_reward = 0
+                episode_step = 0
+                episode += 1
+
+                self.logger.log('train/episode', episode, self.step)
+
+            # sample action for data collection
+            if self.step < self.cfg.num_seed_steps:
+                action = self.env.action_space.sample()
+            else:
+                with utils.eval_mode(self.agent):
+                    action = self.agent.act(obs, sample=True)
+
+            # run training update
+            if self.step >= self.cfg.num_seed_steps:
+                self.agent.update(self.replay_buffer, self.logger, self.step)
+
+            next_obs, reward, done, _ = self.env.step(action)
+
+            # allow infinite bootstrap
+            done = float(done)
+            done_no_max = 0 if episode_step + 1 == self.env._max_episode_steps else done
+            episode_reward += reward
+
+            self.replay_buffer.add(obs, action, reward, next_obs, done,
+                                   done_no_max)
+
+            obs = next_obs
+            episode_step += 1
+            self.step += 1
+
+
+@hydra.main(config_path='config/train.yaml', strict=True)
+def main(cfg):
+    workspace = Workspace(cfg)
+    workspace.run()
+
+
+if __name__ == '__main__':
+    main()
+
+video.py
+import imageio
+import os
+import numpy as np
+import sys
+
+import utils
+
+class VideoRecorder(object):
+    def __init__(self, root_dir, height=256, width=256, camera_id=0, fps=30):
+        self.save_dir = utils.make_dir(root_dir, 'video') if root_dir else None
+        self.height = height
+        self.width = width
+        self.camera_id = camera_id
+        self.fps = fps
+        self.frames = []
+
+    def init(self, enabled=True):
+        self.frames = []
+        self.enabled = self.save_dir is not None and enabled
+
+    def record(self, env):
+        if self.enabled:
+            frame = env.render(mode='rgb_array',
+                               height=self.height,
+                               width=self.width,
+                               camera_id=self.camera_id)
+            self.frames.append(frame)
+
+    def save(self, file_name):
+        if self.enabled:
+            path = os.path.join(self.save_dir, file_name)
+            imageio.mimsave(path, self.frames, fps=self.fps)
+
+config/train.yaml
+defaults:
+    - agent: sac
+
+env: cheetah_run
+
+# this needs to be specified manually
+experiment: test_exp
+
+num_train_steps: 1e6
+replay_buffer_capacity: ${num_train_steps}
+
+num_seed_steps: 5000
+
+eval_frequency: 10000
+num_eval_episodes: 10
+
+device: cuda
+
+# logger
+log_frequency: 10000
+log_save_tb: true
+
+# video recorder
+save_video: true
+
+
+seed: 1
+
+
+# hydra configuration
+hydra:
+    name: ${env}
+    run:
+        dir: ./exp/${now:%Y.%m.%d}/${now:%H%M}_${agent.name}_${experiment}
+config/agent/sac.yaml
+agent:
+  name: sac
+  class: agent.sac.SACAgent
+  params:
+    obs_dim: ??? # to be specified later
+    action_dim: ??? # to be specified later
+    action_range: ??? # to be specified later
+    device: ${device}
+    critic_cfg: ${double_q_critic}
+    actor_cfg: ${diag_gaussian_actor}
+    discount: 0.99
+    init_temperature: 0.1
+    alpha_lr: 1e-4
+    alpha_betas: [0.9, 0.999]
+    actor_lr: 1e-4
+    actor_betas: [0.9, 0.999]
+    actor_update_frequency: 1
+    critic_lr: 1e-4
+    critic_betas: [0.9, 0.999]
+    critic_tau: 0.005
+    critic_target_update_frequency: 2
+    batch_size: 1024
+    learnable_temperature: true
+    
+double_q_critic:
+  class: agent.critic.DoubleQCritic
+  params:
+    obs_dim: ${agent.params.obs_dim}
+    action_dim: ${agent.params.action_dim}
+    hidden_dim: 1024
+    hidden_depth: 2
+    
+diag_gaussian_actor:
+  class: agent.actor.DiagGaussianActor
+  params:
+    obs_dim: ${agent.params.obs_dim}
+    action_dim: ${agent.params.action_dim}
+    hidden_depth: 2
+    hidden_dim: 1024
+    log_std_bounds: [-5, 2]
+agent/__init__.py
+import abc
+
+
+class Agent(object):
+    def reset(self):
+        """For state-full agents this function performs reseting at the beginning of each episode."""
+        pass
+
+    @abc.abstractmethod
+    def train(self, training=True):
+        """Sets the agent in either training or evaluation mode."""
+
+    @abc.abstractmethod
+    def update(self, replay_buffer, logger, step):
+        """Main function of the agent that performs learning."""
+
+    @abc.abstractmethod
+    def act(self, obs, sample=False):
+        """Issues an action given an observation."""
+
+agent/actor.py
+import numpy as np
+import torch
+import math
+from torch import nn
+import torch.nn.functional as F
+from torch import distributions as pyd
+
+import utils
+
+
+class TanhTransform(pyd.transforms.Transform):
+    domain = pyd.constraints.real
+    codomain = pyd.constraints.interval(-1.0, 1.0)
+    bijective = True
+    sign = +1
+
+    def __init__(self, cache_size=1):
+        super().__init__(cache_size=cache_size)
+
+    @staticmethod
+    def atanh(x):
+        return 0.5 * (x.log1p() - (-x).log1p())
+
+    def __eq__(self, other):
+        return isinstance(other, TanhTransform)
+
+    def _call(self, x):
+        return x.tanh()
+
+    def _inverse(self, y):
+        # We do not clamp to the boundary here as it may degrade the performance of certain algorithms.
+        # one should use `cache_size=1` instead
+        return self.atanh(y)
+
+    def log_abs_det_jacobian(self, x, y):
+        # We use a formula that is more numerically stable, see details in the following link
+        # https://github.com/tensorflow/probability/commit/ef6bb176e0ebd1cf6e25c6b5cecdd2428c22963f#diff-e120f70e92e6741bca649f04fcd907b7
+        return 2. * (math.log(2.) - x - F.softplus(-2. * x))
+
+
+class SquashedNormal(pyd.transformed_distribution.TransformedDistribution):
+    def __init__(self, loc, scale):
+        self.loc = loc
+        self.scale = scale
+
+        self.base_dist = pyd.Normal(loc, scale)
+        transforms = [TanhTransform()]
+        super().__init__(self.base_dist, transforms)
+
+    @property
+    def mean(self):
+        mu = self.loc
+        for tr in self.transforms:
+            mu = tr(mu)
+        return mu
+
+
+class DiagGaussianActor(nn.Module):
+    """torch.distributions implementation of an diagonal Gaussian policy."""
+    def __init__(self, obs_dim, action_dim, hidden_dim, hidden_depth,
+                 log_std_bounds):
+        super().__init__()
+
+        self.log_std_bounds = log_std_bounds
+        self.trunk = utils.mlp(obs_dim, hidden_dim, 2 * action_dim,
+                               hidden_depth)
+
+        self.outputs = dict()
+        self.apply(utils.weight_init)
+
+    def forward(self, obs):
+        mu, log_std = self.trunk(obs).chunk(2, dim=-1)
+
+        # constrain log_std inside [log_std_min, log_std_max]
+        log_std = torch.tanh(log_std)
+        log_std_min, log_std_max = self.log_std_bounds
+        log_std = log_std_min + 0.5 * (log_std_max - log_std_min) * (log_std +
+                                                                     1)
+
+        std = log_std.exp()
+
+        self.outputs['mu'] = mu
+        self.outputs['std'] = std
+
+        dist = SquashedNormal(mu, std)
+        return dist
+
+    def log(self, logger, step):
+        for k, v in self.outputs.items():
+            logger.log_histogram(f'train_actor/{k}_hist', v, step)
+
+        for i, m in enumerate(self.trunk):
+            if type(m) == nn.Linear:
+                logger.log_param(f'train_actor/fc{i}', m, step)
+agent/sac.py
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+from agent import Agent
+import utils
+
+import hydra
+
+
+class SACAgent(Agent):
+    """SAC algorithm."""
+    def __init__(self, obs_dim, action_dim, action_range, device, critic_cfg,
+                 actor_cfg, discount, init_temperature, alpha_lr, alpha_betas,
+                 actor_lr, actor_betas, actor_update_frequency, critic_lr,
+                 critic_betas, critic_tau, critic_target_update_frequency,
+                 batch_size, learnable_temperature):
+        super().__init__()
+
+        self.action_range = action_range
+        self.device = torch.device(device)
+        self.discount = discount
+        self.critic_tau = critic_tau
+        self.actor_update_frequency = actor_update_frequency
+        self.critic_target_update_frequency = critic_target_update_frequency
+        self.batch_size = batch_size
+        self.learnable_temperature = learnable_temperature
+
+        self.critic = hydra.utils.instantiate(critic_cfg).to(self.device)
+        self.critic_target = hydra.utils.instantiate(critic_cfg).to(
+            self.device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+
+        self.actor = hydra.utils.instantiate(actor_cfg).to(self.device)
+
+        self.log_alpha = torch.tensor(np.log(init_temperature)).to(self.device)
+        self.log_alpha.requires_grad = True
+        # set target entropy to -|A|
+        self.target_entropy = -action_dim
+
+        # optimizers
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(),
+                                                lr=actor_lr,
+                                                betas=actor_betas)
+
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(),
+                                                 lr=critic_lr,
+                                                 betas=critic_betas)
+
+        self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha],
+                                                    lr=alpha_lr,
+                                                    betas=alpha_betas)
+
+        self.train()
+        self.critic_target.train()
+
+    def train(self, training=True):
+        self.training = training
+        self.actor.train(training)
+        self.critic.train(training)
+
+    @property
+    def alpha(self):
+        return self.log_alpha.exp()
+
+    def act(self, obs, sample=False):
+        obs = torch.FloatTensor(obs).to(self.device)
+        obs = obs.unsqueeze(0)
+        dist = self.actor(obs)
+        action = dist.sample() if sample else dist.mean
+        action = action.clamp(*self.action_range)
+        assert action.ndim == 2 and action.shape[0] == 1
+        return utils.to_np(action[0])
+
+    def update_critic(self, obs, action, reward, next_obs, not_done, logger,
+                      step):
+        dist = self.actor(next_obs)
+        next_action = dist.rsample()
+        log_prob = dist.log_prob(next_action).sum(-1, keepdim=True)
+        target_Q1, target_Q2 = self.critic_target(next_obs, next_action)
+        target_V = torch.min(target_Q1,
+                             target_Q2) - self.alpha.detach() * log_prob
+        target_Q = reward + (not_done * self.discount * target_V)
+        target_Q = target_Q.detach()
+
+        # get current Q estimates
+        current_Q1, current_Q2 = self.critic(obs, action)
+        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(
+            current_Q2, target_Q)
+        logger.log('train_critic/loss', critic_loss, step)
+
+        # Optimize the critic
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        self.critic.log(logger, step)
+
+    def update_actor_and_alpha(self, obs, logger, step):
+        dist = self.actor(obs)
+        action = dist.rsample()
+        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
+        actor_Q1, actor_Q2 = self.critic(obs, action)
+
+        actor_Q = torch.min(actor_Q1, actor_Q2)
+        actor_loss = (self.alpha.detach() * log_prob - actor_Q).mean()
+
+        logger.log('train_actor/loss', actor_loss, step)
+        logger.log('train_actor/target_entropy', self.target_entropy, step)
+        logger.log('train_actor/entropy', -log_prob.mean(), step)
+
+        # optimize the actor
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        self.actor.log(logger, step)
+
+        if self.learnable_temperature:
+            self.log_alpha_optimizer.zero_grad()
+            alpha_loss = (self.alpha *
+                          (-log_prob - self.target_entropy).detach()).mean()
+            logger.log('train_alpha/loss', alpha_loss, step)
+            logger.log('train_alpha/value', self.alpha, step)
+            alpha_loss.backward()
+            self.log_alpha_optimizer.step()
+
+    def update(self, replay_buffer, logger, step):
+        obs, action, reward, next_obs, not_done, not_done_no_max = replay_buffer.sample(
+            self.batch_size)
+
+        logger.log('train/batch_reward', reward.mean(), step)
+
+        self.update_critic(obs, action, reward, next_obs, not_done_no_max,
+                           logger, step)
+
+        if step % self.actor_update_frequency == 0:
+            self.update_actor_and_alpha(obs, logger, step)
+
+        if step % self.critic_target_update_frequency == 0:
+            utils.soft_update_params(self.critic, self.critic_target,
+                                     self.critic_tau)
+
+agent/critic.py
+import numpy as np
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+import utils
+
+
+class DoubleQCritic(nn.Module):
+    """Critic network, employes double Q-learning."""
+    def __init__(self, obs_dim, action_dim, hidden_dim, hidden_depth):
+        super().__init__()
+
+        self.Q1 = utils.mlp(obs_dim + action_dim, hidden_dim, 1, hidden_depth)
+        self.Q2 = utils.mlp(obs_dim + action_dim, hidden_dim, 1, hidden_depth)
+
+        self.outputs = dict()
+        self.apply(utils.weight_init)
+
+    def forward(self, obs, action):
+        assert obs.size(0) == action.size(0)
+
+        obs_action = torch.cat([obs, action], dim=-1)
+        q1 = self.Q1(obs_action)
+        q2 = self.Q2(obs_action)
+
+        self.outputs['q1'] = q1
+        self.outputs['q2'] = q2
+
+        return q1, q2
+
+    def log(self, logger, step):
+        for k, v in self.outputs.items():
+            logger.log_histogram(f'train_critic/{k}_hist', v, step)
+
+        assert len(self.Q1) == len(self.Q2)
+        for i, (m1, m2) in enumerate(zip(self.Q1, self.Q2)):
+            assert type(m1) == type(m2)
+            if type(m1) is nn.Linear:
+                logger.log_param(f'train_critic/q1_fc{i}', m1, step)
+                logger.log_param(f'train_critic/q2_fc{i}', m2, step)
+
