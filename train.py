@@ -9,6 +9,8 @@ import os
 import sys
 import time
 import pickle as pkl
+import argparse
+from datetime import datetime
 
 from video import VideoRecorder
 from logger import Logger
@@ -16,7 +18,6 @@ from replay_buffer import ReplayBuffer
 import utils
 
 import dmc2gym
-import hydra
 
 
 def make_env(cfg):
@@ -49,23 +50,46 @@ class Workspace(object):
         self.logger = Logger(self.work_dir,
                              save_tb=cfg.log_save_tb,
                              log_frequency=cfg.log_frequency,
-                             agent=cfg.agent.name)
+                             agent='sac')  # Hardcoded agent as 'sac'
 
         utils.set_seed_everywhere(cfg.seed)
         self.device = torch.device(cfg.device)
         self.env = utils.make_env(cfg)
 
-        cfg.agent.params.obs_dim = self.env.observation_space.shape[0]
-        cfg.agent.params.action_dim = self.env.action_space.shape[0]
-        cfg.agent.params.action_range = [
+        obs_dim = self.env.observation_space.shape[0]
+        action_dim = self.env.action_space.shape[0]
+        action_range = [
             float(self.env.action_space.low.min()),
             float(self.env.action_space.high.max())
         ]
-        self.agent = hydra.utils.instantiate(cfg.agent)
+
+        # Manually instantiate actor, critic, and agent (replacing hydra.utils.instantiate)
+        from agent.actor import DiagGaussianActor
+        actor_log_std_bounds = [int(x) for x in cfg.actor_log_std_bounds.split(',')]
+        actor = DiagGaussianActor(obs_dim, action_dim, cfg.actor_hidden_dim, cfg.actor_hidden_depth, actor_log_std_bounds)
+
+        from agent.critic import DoubleQCritic
+        critic = DoubleQCritic(obs_dim, action_dim, cfg.critic_hidden_dim, cfg.critic_hidden_depth)
+
+        from agent.sac import SACAgent
+        self.agent = SACAgent(obs_dim, action_dim, action_range, self.device, critic, actor,
+                              discount=cfg.discount,
+                              init_temperature=cfg.init_temperature,
+                              alpha_lr=cfg.alpha_lr,
+                              alpha_betas=[float(x) for x in cfg.alpha_betas.split(',')],
+                              actor_lr=cfg.actor_lr,
+                              actor_betas=[float(x) for x in cfg.actor_betas.split(',')],
+                              actor_update_frequency=cfg.actor_update_frequency,
+                              critic_lr=cfg.critic_lr,
+                              critic_betas=[float(x) for x in cfg.critic_betas.split(',')],
+                              critic_tau=cfg.critic_tau,
+                              critic_target_update_frequency=cfg.critic_target_update_frequency,
+                              batch_size=cfg.batch_size,
+                              learnable_temperature=cfg.learnable_temperature)
 
         self.replay_buffer = ReplayBuffer(self.env.observation_space.shape,
                                           self.env.action_space.shape,
-                                          int(cfg.replay_buffer_capacity),
+                                          cfg.replay_buffer_capacity,
                                           self.device)
 
         self.video_recorder = VideoRecorder(
@@ -149,9 +173,58 @@ class Workspace(object):
             self.step += 1
 
 
-@hydra.main(config_path='config/train.yaml', strict=True)
-def main(cfg):
-    workspace = Workspace(cfg)
+def main():
+    parser = argparse.ArgumentParser(description='SAC Training Script')
+
+    # Parameters from train.yaml
+    parser.add_argument('--env', type=str, default='cheetah_run', help='Environment name')
+    parser.add_argument('--experiment', type=str, default='test_exp', help='Experiment name')
+    parser.add_argument('--num_train_steps', type=int, default=1000000, help='Number of training steps')
+    parser.add_argument('--replay_buffer_capacity', type=int, default=None, help='Replay buffer capacity (defaults to num_train_steps)')
+    parser.add_argument('--num_seed_steps', type=int, default=5000, help='Number of seed steps')
+    parser.add_argument('--eval_frequency', type=int, default=10000, help='Evaluation frequency')
+    parser.add_argument('--num_eval_episodes', type=int, default=10, help='Number of evaluation episodes')
+    parser.add_argument('--device', type=str, default='cuda', help='Device (cuda or cpu)')
+    parser.add_argument('--log_frequency', type=int, default=10000, help='Logging frequency')
+    parser.add_argument('--log_save_tb', action='store_true', default=True, help='Save TensorBoard logs')
+    parser.add_argument('--save_video', action='store_true', default=True, help='Save evaluation videos')
+    parser.add_argument('--seed', type=int, default=1, help='Random seed')
+
+    # SAC-specific parameters from sac.yaml
+    parser.add_argument('--discount', type=float, default=0.99, help='Discount factor')
+    parser.add_argument('--init_temperature', type=float, default=0.1, help='Initial temperature')
+    parser.add_argument('--alpha_lr', type=float, default=1e-4, help='Alpha learning rate')
+    parser.add_argument('--alpha_betas', type=str, default='0.9,0.999', help='Alpha betas (comma-separated)')
+    parser.add_argument('--actor_lr', type=float, default=1e-4, help='Actor learning rate')
+    parser.add_argument('--actor_betas', type=str, default='0.9,0.999', help='Actor betas (comma-separated)')
+    parser.add_argument('--actor_update_frequency', type=int, default=1, help='Actor update frequency')
+    parser.add_argument('--critic_lr', type=float, default=1e-4, help='Critic learning rate')
+    parser.add_argument('--critic_betas', type=str, default='0.9,0.999', help='Critic betas (comma-separated)')
+    parser.add_argument('--critic_tau', type=float, default=0.005, help='Critic tau')
+    parser.add_argument('--critic_target_update_frequency', type=int, default=2, help='Critic target update frequency')
+    parser.add_argument('--batch_size', type=int, default=1024, help='Batch size')
+    parser.add_argument('--learnable_temperature', action='store_true', default=True, help='Learnable temperature')
+
+    # Actor and Critic architecture parameters
+    parser.add_argument('--actor_hidden_dim', type=int, default=1024, help='Actor hidden dimension')
+    parser.add_argument('--actor_hidden_depth', type=int, default=2, help='Actor hidden depth')
+    parser.add_argument('--actor_log_std_bounds', type=str, default='-5,2', help='Actor log std bounds (comma-separated)')
+    parser.add_argument('--critic_hidden_dim', type=int, default=1024, help='Critic hidden dimension')
+    parser.add_argument('--critic_hidden_depth', type=int, default=2, help='Critic hidden depth')
+
+    args = parser.parse_args()
+
+    # Simulate YAML interpolation: replay_buffer_capacity defaults to num_train_steps
+    if args.replay_buffer_capacity is None:
+        args.replay_buffer_capacity = args.num_train_steps
+
+    # Create output directory similar to Hydra
+    now = datetime.now()
+    output_dir = f"./exp/{now.strftime('%Y.%m.%d')}/{now.strftime('%H%M')}_sac_{args.experiment}"
+    os.makedirs(output_dir, exist_ok=True)
+    os.chdir(output_dir)
+
+    workspace = Workspace(args)
     workspace.run()
 
 
