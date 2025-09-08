@@ -86,7 +86,8 @@ class Workspace(object):
                               critic_target_update_frequency=cfg.critic_target_update_frequency,
                               batch_size=cfg.batch_size,
                               learnable_temperature=cfg.learnable_temperature,
-                              chunk_size=cfg.chunk_size)
+                              chunk_size=cfg.chunk_size,
+                              confidence_threshold=cfg.confidence_threshold)
 
         self.replay_buffer = ReplayBuffer(self.env.observation_space.shape,
                                           self.env.action_space.shape,
@@ -107,15 +108,31 @@ class Workspace(object):
             done = False
             episode_reward = 0
             self.chunk_step = 0
+            current_action_chunk = None
+            current_confidences = None
+            current_k = self.cfg.chunk_size
+
             while not done:
-                if self.chunk_step == 0:
+                if self.chunk_step == 0 or self.chunk_step >= current_k:
                     with utils.eval_mode(self.agent):
-                        action_chunk = self.agent.act(obs, sample=False)
-                action = action_chunk[self.chunk_step]
+                        current_action_chunk, current_confidences = self.agent.act(obs, sample=False)
+                    # Calculate dynamic k
+                    for i in range(self.cfg.chunk_size):
+                        if current_confidences[0, i] < self.cfg.confidence_threshold:
+                            current_k = max(1, i + 1)
+                            break
+                    else:
+                        current_k = self.cfg.chunk_size
+                    # Log for evaluation (optional, as eval doesn't affect training logs)
+                    self.logger.log('eval/avg_confidence', np.mean(current_confidences), self.step)
+                    self.logger.log('eval/chunk_length', current_k, self.step)
+                    self.chunk_step = 0
+
+                action = current_action_chunk[self.chunk_step].reshape(-1)  # Select action from chunk
                 obs, reward, done, _ = self.env.step(action)
                 self.video_recorder.record(self.env)
                 episode_reward += reward
-                self.chunk_step = (self.chunk_step + 1) % self.cfg.chunk_size
+                self.chunk_step += 1
 
             average_episode_reward += episode_reward
             self.video_recorder.save(f'{self.step}.mp4')
@@ -127,7 +144,11 @@ class Workspace(object):
     def run(self):
         episode, episode_reward, done = 0, 0, True
         start_time = time.time()
-        current_chunk = None
+        current_action_chunk = None
+        current_confidences = None
+        current_k = self.cfg.chunk_size
+        chunk_start_step = 0  # Track global step for chunk start
+
         while self.step < self.cfg.num_train_steps:
             if done:
                 if self.step > 0:
@@ -152,20 +173,41 @@ class Workspace(object):
                 episode_step = 0
                 episode += 1
                 self.chunk_step = 0
-                current_chunk = None
+                current_action_chunk = None
+                current_confidences = None
+                current_k = self.cfg.chunk_size
+                chunk_start_step = self.step
 
                 self.logger.log('train/episode', episode, self.step)
 
             # sample action for data collection
-            if self.chunk_step == 0:  # Predict new chunk every h steps
+            if self.chunk_step == 0 or self.chunk_step >= current_k:
                 if self.step < self.cfg.num_seed_steps:
-                    current_chunk = np.array([self.env.action_space.sample() for _ in range(self.cfg.chunk_size)])
+                    current_action_chunk = np.array([self.env.action_space.sample() for _ in range(self.cfg.chunk_size)])
+                    current_confidences = np.ones((1, self.cfg.chunk_size))  # Full confidence for seed
+                    current_k = self.cfg.chunk_size
                 else:
                     with utils.eval_mode(self.agent):
-                        current_chunk = self.agent.act(obs, sample=True)
-                current_chunk = np.clip(current_chunk, self.env.action_space.low, self.env.action_space.high)
+                        current_action_chunk, current_confidences = self.agent.act(obs, sample=True)
+                    # Calculate dynamic k
+                    for i in range(self.cfg.chunk_size):
+                        if current_confidences[0, i] < self.cfg.confidence_threshold:
+                            current_k = max(1, i + 1)
+                            break
+                    else:
+                        current_k = self.cfg.chunk_size
+                
+                # Reset chunk_step and record chunk start
+                self.chunk_step = 0
+                chunk_start_step = self.step  # Global step where this chunk starts
+                
+                # Log confidence mean and chunk length k
+                self.logger.log('train/avg_confidence', np.mean(current_confidences), self.step)
+                self.logger.log('train/chunk_length', current_k, self.step)
 
-            action = current_chunk[self.chunk_step]  # Execute one action from chunk
+            action = current_action_chunk[self.chunk_step]  # Execute one action from chunk
+            # Clip actions
+            action = np.clip(action, self.env.action_space.low, self.env.action_space.high)
 
             # run training update
             if self.step >= self.cfg.num_seed_steps:
@@ -184,7 +226,12 @@ class Workspace(object):
             obs = next_obs
             episode_step += 1
             self.step += 1
-            self.chunk_step = (self.chunk_step + 1) % self.cfg.chunk_size
+            self.chunk_step += 1
+
+            # If we've executed the full k steps of the current chunk, add to chunk_starts
+            if self.chunk_step >= current_k:
+                chunk_start_idx = (chunk_start_step) % self.replay_buffer.capacity
+                self.replay_buffer.add_chunk(chunk_start_idx, current_k)
 
 
 def main():
@@ -228,6 +275,9 @@ def main():
 
     # New parameter for chunking
     parser.add_argument('--chunk_size', type=int, default=5, help='Action chunk size (h) for temporally extended action space')
+
+    # New parameter for variable step length
+    parser.add_argument('--confidence_threshold', type=float, default=0.5, help='Confidence threshold for dynamic chunk length')
 
     args = parser.parse_args()
 

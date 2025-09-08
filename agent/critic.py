@@ -12,18 +12,27 @@ class DoubleQCritic(nn.Module):
         super().__init__()
 
         self.chunk_size = chunk_size
+        self.action_dim = action_dim
         self.extended_action_dim = action_dim * chunk_size  # Extended dim
 
-        self.Q1 = utils.mlp(obs_dim + self.extended_action_dim, hidden_dim, 1, hidden_depth)
-        self.Q2 = utils.mlp(obs_dim + self.extended_action_dim, hidden_dim, 1, hidden_depth)
+        input_dim = obs_dim + self.extended_action_dim
+        self.Q1 = utils.mlp(input_dim, hidden_dim, 1, hidden_depth)
+        self.Q2 = utils.mlp(input_dim, hidden_dim, 1, hidden_depth)
 
         self.outputs = dict()
         self.apply(utils.weight_init)
 
-    def forward(self, obs, action_chunk):
+    def forward(self, obs, action_chunk, mask):
         assert obs.size(0) == action_chunk.size(0)
+        assert mask.size(1) == self.chunk_size  # mask: [batch, h]
 
-        obs_action = torch.cat([obs, action_chunk], dim=-1)
+        batch_size = obs.size(0)
+        # Expand mask to [batch, h * action_dim]
+        expanded_mask = mask.unsqueeze(-1).repeat(1, 1, self.action_dim).view(batch_size, self.extended_action_dim)
+        # Mask the action_chunk: non-executed parts become 0
+        action_masked = action_chunk * expanded_mask
+
+        obs_action = torch.cat([obs, action_masked], dim=-1)
         q1 = self.Q1(obs_action)
         q2 = self.Q2(obs_action)
 

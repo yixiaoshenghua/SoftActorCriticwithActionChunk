@@ -63,6 +63,10 @@ class DiagGaussianActor(nn.Module):
         self.trunk = utils.mlp(obs_dim, hidden_dim, 2 * self.extended_action_dim,
                                hidden_depth)
 
+        # Additional trunk for confidences [0,1]
+        self.conf_trunk = utils.mlp(obs_dim, hidden_dim, chunk_size, hidden_depth,
+                                    output_mod=nn.Sigmoid())
+
         self.outputs = dict()
         self.apply(utils.weight_init)
 
@@ -80,7 +84,11 @@ class DiagGaussianActor(nn.Module):
         self.outputs['std'] = std
 
         dist = SquashedNormal(mu, std)
-        return dist
+
+        confidences = self.conf_trunk(obs)
+        self.outputs['confidences'] = confidences
+
+        return dist, confidences
 
     def log(self, logger, step):
         for k, v in self.outputs.items():

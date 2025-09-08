@@ -5,6 +5,7 @@ This is a PyTorch implementation of Soft Actor-Critic (SAC) [[ArXiv]](https://ar
 Key modifications:
 - Parameter passing switched from Hydra to argparse for simplicity.
 - Added support for action chunking (temporally extended actions) via the `--chunk_size` parameter (default: 5). Set to 1 to recover standard SAC.
+- Added variable action step length via actor confidence output and threshold. Use `--confidence_threshold` (default: 0.5) to control the dynamic chunk length based on confidence. The actor outputs a fixed chunk of size h and confidences[h]; the effective length k is the prefix until confidence drops below threshold.
 
 If you use this code in your research project please cite us as:
 ```
@@ -36,6 +37,11 @@ python train.py --env cheetah_run
 To enable Q-chunking with chunk size 5 (temporally extended action space):
 ```
 python train.py --env cheetah_run --chunk_size 5
+```
+
+To enable variable chunk length with confidence threshold 0.5:
+```
+python train.py --env cheetah_run --chunk_size 5 --num_train_steps 2000000 --eval_frequency 20000 --experiment va_cheetah_run --confidence_threshold 0.5
 ```
 
 This will produce an `exp` folder, where all the outputs are going to be stored including train/eval logs, tensorboard blobs, and evaluation episode videos. One can attach TensorBoard to monitor training by running:
